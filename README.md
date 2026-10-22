@@ -1,54 +1,58 @@
 # slopteam
 
-**Idea → tickets → code → tests → deploy.** A small, resumable development
-pipeline installed as an [Omnigent](https://omnigent.ai) agent. **Codex is the
-default harness.** It uses your existing Omni login and model configuration.
+**Idea → Git-repo tickets → code → tests → deploy**, with separate agents.
 
-Give it an idea in a repository. Slopteam scopes the first useful release,
-creates tickets, implements them in dependency order, runs checks, deploys
-to your configured target, and verifies the result. The agent makes engineering
-decisions; a dependency-free Python helper records progress and checks stage gates.
+Slopteam is an [Omnigent](https://omnigent.ai) coordinator with four workers,
+all defaulting to **Codex**:
+
+| Agent | Job |
+| --- | --- |
+| Planner | Scope the smallest useful release and write tickets |
+| Builder | Implement a ticket and commit its code |
+| Tester | Independently review behavior and run meaningful checks |
+| Deployer | Deploy the tested commit and verify the live result |
+
+Each worker runs in its own Omni conversation. The coordinator dispatches work,
+records session IDs and moves the result to the next stage. Workers run in order
+in one task worktree. Each builder ticket and each testing pass gets a fresh
+conversation; a tester never reuses the builder's conversation. Failed QA goes
+back to a builder, then a new tester.
+
+Tickets are ordinary **Git-tracked Markdown files** under
+`docs/slopteam/RUN_ID/`. There is no GitHub API, issue tracker, `gh` dependency or
+automatic push. Local Git repositories work without a remote.
 
 ## Install
 
-Requires Omnigent (validated with 0.19.0), a configured Codex harness, Git,
-Python 3.10+ on macOS/Linux, and authenticated `gh` for GitHub tickets.
+Requires Omnigent (validated with 0.19.0), a configured Codex harness, Git and
+Python 3.10+ on macOS/Linux. From this checkout:
 
 ```sh
-git clone https://github.com/garyamorris/slopteam.git
-cd slopteam
 python3 scripts/install.py
 ```
 
-This registers the agent in Omni and links `~/.local/bin/slopteam` to this
-checkout. Keep the checkout in place. Re-run the installer after pulling updates.
-Use `--agent-only` to skip the command shortcut. No background service is needed.
-
-You can also install the self-contained agent bundle directly:
-
-```sh
-omni agent add garyamorris/slopteam/agent --yes
-```
+This installs the entire agent team in Omni and links `~/.local/bin/slopteam`
+to this checkout. Keep the checkout in place. Use `--agent-only` to skip the
+shortcut, or install just the portable bundle with `omni agent add ./agent`.
+No background service is needed; existing Omni agents remain available.
 
 ## Use
 
 In Omni, create a chat, select **slopteam**, choose the target repository and
-describe your idea. Its Codex prompt loads the bundled workflow automatically.
-
-From a terminal:
+give it an idea. The coordinator loads its workflow and dispatches the planner.
+The stage conversations appear as child sessions in Omni.
 
 ```sh
-slopteam --repo /path/to/my-app "Build a simple habit tracker and deploy a preview"
+slopteam --repo /path/to/my-app "Build a habit tracker and deploy to my preview target"
 slopteam --repo /path/to/my-app "Continue the current run"
 slopteam --repo /path/to/my-app --resume CONVERSATION_ID "Continue"
 ```
 
-Use `--model MODEL` or `--harness HARNESS` for an explicit override. The launcher
-passes `--harness codex` by default even when another Omni global harness is set.
-Installation adds Slopteam beside your existing agents; its harness is scoped
-to Slopteam. `--dry-run` prints the launch request without starting a session.
+The coordinator and four workers all use your configured Codex model by default.
+`--model` and `--harness` override the coordinator only; worker defaults are in
+`agent/agents/ROLE/config.yaml`. `--dry-run` prints the launch request.
 
-For inspection and recovery:
+For inspection:
 
 ```sh
 slopteam pipeline --repo /path/to/my-app status
@@ -56,32 +60,34 @@ slopteam pipeline --repo /path/to/my-app --run RUN_ID status
 slopteam pipeline --help
 ```
 
-## What it records
+## Progress and release checks
 
-Each run keeps an idea, ticket dependency graph, GitHub issue links, ticket
-progress, test/build results, deployment attempt and smoke result. State and logs
-live in `.slopteam/` in the target worktree; the helper adds a local Git exclusion.
-Do not commit the state or logs: commands may print sensitive project information.
+The coordinator starts agent runs with `init --team`. Checkpoints and command
+logs live in `.slopteam/`, locally excluded from Git. They include the actual
+worker session IDs, role, assigned ticket, result summary, commit and source
+fingerprint. Git tracks the ticket contracts and implementation progress;
+checkpoints remain local to the task worktree.
 
-- **Tickets:** validated dependencies; deterministic run markers prevent duplicate
-  issue creation on ordinary retries. An uncertain API result requires reconciliation.
-- **Code:** the agent implements each ticket and records its acceptance evidence.
-- **Tests:** the helper runs actual shell commands, records exit status and logs,
-  and fingerprints source. Code changes invalidate the earlier test results.
-- **Deploy:** requires all tickets implemented, a clean commit and current passing
-  checks. Deployment runs once, followed by a live smoke command.
-- **Recovery:** failures remain visible. Interrupted deployment attempts are never
-  automatically repeated; `verify-deploy` reruns only verification.
+The helper rejects duplicate worker session IDs, concurrent workers in the same
+run and out-of-order stages. Deployment requires completed planner/builder/tester
+agents, a separate assigned deployer, all tickets done, a clean commit, current
+passing checks and the independent tester's matching source fingerprint.
 
-The helper verifies process results and source identity. The agent must choose
-meaningful tests and a smoke check that proves the right release is live; a zero
-exit code from a no-op command is not proof of product correctness. Ignored files,
-external services and environment variables are outside the source fingerprint.
+A deployment runs once, followed by a live smoke check. Interrupted attempts are
+never automatically repeated; `verify-deploy` retries verification only. A worker
+failure stays visible and the coordinator reconciles existing sessions before
+redispatching. Installation never starts a product deployment.
 
-Deployments use the project's existing provider and credentials. If no target is
-configured, Slopteam completes the work it can and asks for the missing target.
-No hosting account, production deployment or paid service is created merely by
-installing this agent. Native harness permission prompts still apply.
+The agent must choose useful tests and a smoke check that proves the right
+release is live. A zero exit code from a no-op is not proof of correctness.
+Ignored files, services and environment variables are outside the source
+fingerprint. The helper records observed worker IDs/results; it is not a security
+boundary against an agent deliberately falsifying its checkpoint.
+
+Deployments use your project's scripts, target and credentials. If a target is
+missing, the team preserves the tested work and asks for that detail. No hosting
+account or paid service is created by installation. An existing Git remote stays
+configured, but the pipeline does not push to it.
 
 ## Development
 
@@ -89,11 +95,12 @@ installing this agent. Native harness permission prompts still apply.
 python3 -m unittest discover -s tests -v
 ```
 
-The tests exercise real temporary Git repositories and shell commands, including
-deployment/smoke failures and stale-test rejection. GitHub is mocked in unit tests;
-they never publish issues or deploy to an external service. CI runs on Python
-3.10, 3.12 and 3.14.
+Tests use real temporary Git repositories and shell commands. They check stage
+ordering, worker separation, Git tickets, QA retries, stale evidence, interrupted
+deployments and local deployment/smoke failure recovery. They never contact
+GitHub or publish to external hosting.
 
-`agent/` is the portable Omni bundle. Its `skills/slopteam/scripts/pipeline.py`
-contains the ledger and command runner. `scripts/launch.py` and `bin/slopteam`
-provide the convenience launcher; the bundle also works without those shortcuts.
+`agent/` is the self-contained bundle, including the four role configurations,
+coordinator workflow and dependency-free Python ledger. `scripts/launch.py` and
+`bin/slopteam` are optional local conveniences. Without `--team`, the helper can
+also be used manually; the installed agent always uses the full team workflow.

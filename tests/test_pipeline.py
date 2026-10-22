@@ -67,6 +67,8 @@ class PipelineTest(unittest.TestCase):
         self.p.plan(plan())
         self.p.mark("T1", "in_progress", "")
         self.p.mark("T1", "done", "Prints hello; checked output")
+        self.git("add", "docs/slopteam")
+        self.git("commit", "-m", "Complete local ticket")
         self.p.check(self.check_command, 10)
 
     def deploy(self, command="true", smoke="true", retry=False):
@@ -221,57 +223,103 @@ class PipelineTest(unittest.TestCase):
         with self.assertRaisesRegex(Blocked, "Invalid run"):
             Pipeline(self.repo, "../elsewhere").load()
 
-    def test_github_publish_is_idempotent(self):
-        self.p.plan(plan())
-        issue = {"number": 12, "html_url": "https://github.com/acme/project/issues/12"}
-        with patch.object(self.p, "gh", side_effect=[[[]], issue, [[]]]) as gh:
-            self.p.publish_tickets("acme/project")
-            self.p.publish_tickets("acme/project")
-        self.assertEqual(gh.call_count, 3)
-        self.assertEqual(self.p.ticket("T1")["issue"], 12)
-        self.assertIn(
-            self.p.marker(self.p.ticket("T1")), gh.call_args_list[1].args[1]["body"]
-        )
-
-    def test_github_ambiguous_result_is_reconciled_before_retry(self):
-        self.p.plan(plan())
-        with patch.object(self.p, "gh", side_effect=[[[]], Blocked("timeout")]):
-            with self.assertRaises(Blocked):
-                self.p.publish_tickets("acme/project")
-        self.assertTrue(self.p.ticket("T1")["publishing"])
-        with patch.object(self.p, "gh", return_value=[[]]) as gh:
-            with self.assertRaisesRegex(Blocked, "uncertain"):
-                self.p.publish_tickets("acme/project")
-            self.assertEqual(gh.call_count, 1)
-        issue = {
-            "number": 3,
-            "html_url": "https://github.com/acme/project/issues/3",
-            "body": self.p.marker(self.p.ticket("T1")),
-        }
-        with patch.object(self.p, "gh", return_value=[[issue]]):
-            self.p.publish_tickets("acme/project")
-        self.assertEqual(self.p.ticket("T1")["issue"], 3)
-
-    def test_reconciliation_checks_exact_marker_and_repository_binding(self):
-        self.p.plan(plan())
-        self.p.state["github"] = "acme/project"
-        with patch.object(self.p, "gh", return_value={"body": "unrelated"}):
-            with self.assertRaisesRegex(Blocked, "exact run marker"):
-                self.p.reconcile_ticket("T1", 99, False)
-        with self.assertRaisesRegex(Blocked, "another GitHub"):
-            self.p.publish_tickets("acme/other")
-
-    def test_issues_only_close_after_verified_deployment(self):
+    def test_tickets_are_versioned_git_files(self):
         self.ready()
-        self.p.state["github"] = "acme/project"
-        self.p.ticket("T1")["issue"] = 12
-        with self.assertRaisesRegex(Blocked, "Verify"):
-            self.p.close_tickets()
+        ticket = self.p.ticket("T1")
+        path = self.repo / ticket["path"]
+        self.assertIn("Status: done", path.read_text())
+        self.assertIn("Prints hello", path.read_text())
+        self.assertEqual(self.git("ls-files", ticket["path"]), ticket["path"])
+        self.assertNotIn("github", self.p.state)
+
+    def team_built(self):
+        self.p.worker_start("planner", "planner-1", "Plan release")
+        self.p.plan(plan())
+        self.git("add", "docs")
+        self.git("commit", "-m", "Plan release")
+        self.p.worker_finish("planner-1", "completed", "Ticket plan committed")
+        self.p.worker_start("builder", "builder-1", "Build greeting", "T1")
+        self.p.mark("T1", "in_progress", "")
+        self.p.mark("T1", "done", "Greeting implemented")
+        self.git("add", "docs")
+        self.git("commit", "-m", "Implement greeting")
+        self.p.worker_finish("builder-1", "completed", "Implementation committed")
+
+    def team_tested(self):
+        self.team_built()
+        self.p.worker_start("tester", "tester-1", "Independent QA")
+        self.p.check(self.check_command, 10)
+        self.p.worker_finish("tester-1", "completed", "Acceptance and checks passed")
+
+    def test_four_distinct_workers_complete_a_release(self):
+        self.team_tested()
+        self.p.worker_start("deployer", "deployer-1", "Deploy release")
         self.deploy()
-        with patch.object(self.p, "gh", return_value={"state": "closed"}) as gh:
-            self.p.close_tickets()
-            self.p.close_tickets()
-            self.assertEqual(gh.call_count, 1)
+        self.p.worker_finish("deployer-1", "completed", "Smoke verified")
+        workers = Pipeline(self.repo).load()["workers"]
+        self.assertEqual(
+            [w["role"] for w in workers], ["planner", "builder", "tester", "deployer"]
+        )
+        self.assertEqual(len({w["session_id"] for w in workers}), 4)
+        self.assertTrue(all(w["status"] == "completed" for w in workers))
+
+    def test_team_rejects_reused_session_and_concurrent_workers(self):
+        self.p.worker_start("planner", "plan-1", "Plan")
+        with self.assertRaisesRegex(Blocked, "running worker"):
+            self.p.worker_start("planner", "plan-2", "Duplicate plan")
+        self.p.worker_finish("plan-1", "failed", "Could not plan")
+        with self.assertRaisesRegex(Blocked, "distinct session"):
+            self.p.worker_start("tester", "plan-1", "Pretend to be separate")
+
+    def test_team_requires_stage_order_and_real_ticket_output(self):
+        with self.assertRaisesRegex(Blocked, "planner must complete"):
+            self.p.worker_start("builder", "build-1", "Build", "T1")
+        self.p.worker_start("planner", "plan-1", "Plan")
+        with self.assertRaisesRegex(Blocked, "not produced"):
+            self.p.worker_finish("plan-1", "completed", "Claimed success")
+
+    def test_team_deployment_requires_independent_qa_and_deployer(self):
+        self.team_built()
+        self.p.check(self.check_command, 10)
+        with self.assertRaisesRegex(Blocked, "separate tester"):
+            self.deploy()
+        self.p.worker_start("tester", "tester-1", "QA")
+        self.p.worker_finish("tester-1", "completed", "Verified current checks")
+        with self.assertRaisesRegex(Blocked, "separate deployer"):
+            self.deploy()
+
+    def test_source_change_requires_fresh_independent_tester(self):
+        self.team_tested()
+        (self.repo / "app.py").write_text('print("new release")\n')
+        self.git("add", "app.py")
+        self.git("commit", "-m", "Change release after QA")
+        self.p.check(self.check_command, 10)
+        with self.assertRaisesRegex(Blocked, "independent tester"):
+            self.p.worker_start("deployer", "deploy-1", "Deploy stale QA")
+
+    def test_failed_qa_returns_to_new_builder_and_new_tester(self):
+        self.team_built()
+        self.p.worker_start("tester", "tester-1", "QA")
+        self.p.worker_finish("tester-1", "failed", "Greeting did not meet acceptance")
+        self.p.worker_start("builder", "builder-2", "Fix greeting", "T1")
+        self.p.mark("T1", "in_progress", "Repair QA finding")
+        (self.repo / "app.py").write_text('print("hello, fixed")\n')
+        self.p.mark("T1", "done", "Greeting repaired")
+        self.git("add", "app.py", "docs")
+        self.git("commit", "-m", "Fix greeting")
+        self.p.worker_finish("builder-2", "completed", "Repair committed")
+        self.p.worker_start("tester", "tester-2", "Fresh QA")
+        self.p.check(self.check_command, 10)
+        self.p.worker_finish("tester-2", "completed", "Repair verified")
+        self.p.worker_start("deployer", "deploy-1", "Deploy repaired release")
+        self.deploy()
+        self.assertEqual(self.p.state["deployment"]["status"], "verified")
+
+    def test_failed_deployment_cannot_be_reported_as_completed_worker(self):
+        self.team_tested()
+        self.p.worker_start("deployer", "deploy-1", "Deploy")
+        with self.assertRaisesRegex(Blocked, "not verified"):
+            self.p.worker_finish("deploy-1", "completed", "False success")
 
     def test_cli_status_reads_existing_run(self):
         result = subprocess.run(

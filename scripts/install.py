@@ -33,7 +33,7 @@ def main():
             destination.symlink_to(target)
         print(f"Command installed: {destination}")
     print(
-        "Slopteam installed with Codex as its default harness. Select slopteam in Omni."
+        "Slopteam's coordinator and four separate Codex workers are installed. Select slopteam in Omni."
     )
 
 

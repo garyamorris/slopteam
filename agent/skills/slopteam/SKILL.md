@@ -1,97 +1,125 @@
 ---
 name: slopteam
-description: Take a software idea through GitHub tickets, implementation, tests and a verified deployment, with resumable progress. Use for slopteam runs or an explicitly requested idea-to-deployment pipeline.
+description: Coordinate separate planner, builder, tester and deployer agents to take an idea through Git-repository tickets, code, tests and verified deployment. Use for Slopteam runs and their recovery.
 ---
 
 # Slopteam
 
-Turn the user's idea into a small working release. Work through the stages below
-in one session, continuing after successful steps. Codex is the default
-runtime; retain the selected model. This workflow does not require multiple agents.
+You are the coordinator. Four **separate Codex conversations** perform the work:
 
-The deterministic helper is `scripts/pipeline.py` relative to this skill. Run it
-with Python 3.10+. The installed shortcut is `slopteam pipeline ...`. Start with
-`slopteam pipeline --help` and `slopteam pipeline status`. All pipeline commands
-run from the target Git repository, or accept `--repo /absolute/path` before the
-subcommand. State and command logs live in `.slopteam/`, locally excluded from Git.
-If the shortcut is unavailable, use the helper's absolute path instead.
+| Agent | Owns | Hands off |
+| --- | --- | --- |
+| `planner` | Scope, acceptance criteria, local tickets | Committed ticket plan |
+| `builder` | One ticket or repair | Implemented ticket and clean commit |
+| `tester` | Independent review and meaningful tests | Pass/fail evidence for that commit |
+| `deployer` | Release to the authorized target and live smoke | Verified URL and release identity |
 
-## Idea and tickets
+Do not perform these stages yourself or relabel one conversation as multiple
+agents. Separate agents need distinct session IDs; different models are optional.
+Codex is the default for every role. No role spawns further agents.
 
-Inspect repository instructions, existing work, test commands, deployment files
-and GitHub remote. Use a clean task branch/worktree; preserve unrelated changes.
-If no repository exists, initialize one in the requested location. Create a
-remote when the user authorized publishing; otherwise keep tickets local.
-Avoid choosing a paid hosting service or production target without user direction.
+Use **Git repositories**, not GitHub services. Tickets live in committed Markdown
+at `docs/slopteam/RUN_ID/TICKET_ID.md`. Do not use `gh`, GitHub issues/APIs or
+remote pushes unless the user separately changes that instruction. An existing
+Git remote can remain configured without being used.
 
-Create a short product brief with the smallest useful scope and observable
-acceptance criteria. Use `init --idea "..."` once. On continuation, inspect
-`status` and resume the existing run instead of creating duplicate tickets.
-`--run ID` selects an older run. Create a JSON plan file in `.slopteam/`:
+## Coordinator setup
 
-```json
-{"tickets":[{"id":"T1","title":"Build the smallest useful feature",
-"body":"Scope and implementation notes",
-"acceptance":["An observable result the user can verify"],"depends_on":[]}]}
+The helper is `scripts/pipeline.py` relative to this skill, or the installed
+`slopteam pipeline` shortcut. Prefer the helper's absolute path when handing it
+to workers so the bundle is portable without the shortcut. Python 3.10+ is enough.
+Commands take `--repo ABSOLUTE_WORKSPACE` and optional `--run ID` **before** the
+subcommand. `status` shows local checkpoints under `.slopteam/`, excluded from Git.
+
+Inspect the workspace and repository instructions briefly. Reuse a suitable
+clean task worktree or create one if isolation is needed. Preserve other work.
+Use one task worktree for the run and **one active worker at a time**; each worker
+has its own conversation and receives the previous stage's committed files.
+There is no automatic parallel writing or cherry-pick step.
+
+Read `status`; if there is no run, use `init --team --idea "..."`. Resume existing
+progress rather than creating duplicate tickets or deployments. If no Git repo
+exists, initialize it in the requested directory. The planner can make the first
+commit. Do not require a remote repository.
+
+## Dispatch and handoff
+
+Use `sys_session_send` with `agent` set to one of the four role names, a unique
+human-readable `title`, and `args.input` containing a standalone assignment.
+Include the role, absolute workspace and helper paths, run ID, assigned ticket,
+acceptance criteria, current commit, prior stage artifacts, authorized deployment
+target, and constraints. Tell the worker to run every command in that worktree;
+the send API does not accept a `cwd` override. Use
+`args.purpose: "implement"` for planner/builder/deployer and `"review"` for tester;
+those values are transport categories, not permission to exceed the role.
+Use a fresh conversation for each dispatch, including each builder ticket and
+new tester pass. Do not reuse the builder's conversation for testing.
+
+Immediately record the returned `conversation_id`:
+
+```sh
+python3 /absolute/path/pipeline.py --repo /task/worktree worker start \
+  --role planner --session-id ACTUAL_CONVERSATION_ID --task "Plan the release"
 ```
 
-Load it with `plan --file .slopteam/plan.json`. Tickets should be small enough
-to implement and test individually; dependencies determine execution order.
-Use `tickets --github OWNER/REPO` to publish real GitHub issues. This command
-reconciles exact run markers before creating issues. If a creation outcome is
-uncertain, it stops: check GitHub and use `reconcile-ticket ID --issue NUMBER`,
-or `--not-created` only after confirming absence. Do not blindly retry mutations.
+For a builder, also pass `--ticket T1`. The helper rejects reused session IDs,
+concurrent workers and out-of-order stages. Never invent an ID. If dispatch has
+an uncertain outcome, inspect Omni's sessions/history before creating another.
 
-## Code and tests
+Workers run autonomously and notify the coordinator through the inbox. Call
+`sys_read_inbox` once; if the dispatched worker is still active, end your turn
+and let completion wake you. Do not poll with sleeps/timers. Use
+`sys_session_get_history` for unclear/empty results or recovery. Once terminal
+completion is confirmed, record it using `worker finish --session-id ID
+--status completed --summary "Result and evidence"`, or `--status failed`.
+Worker completion is recorded by the coordinator, never self-certified by a worker.
+Then dispatch the next stage in the same turn.
 
-For each available ticket, run `ticket ID --status in_progress`, implement it,
-and exercise its acceptance criteria. Commit scoped changes, then run
-`ticket ID --status done --summary "What changed and how it was checked"`.
-The helper enforces dependencies. Done means implemented, not deployed.
-If GitHub is unavailable, local tickets still support implementation and tests.
+## Stage contracts
 
-After all tickets are done, run each relevant test/build/lint command through
-`check --command "..."`. Select meaningful checks for the actual change; a
-trivial `true` command is not a test. The helper records exit codes, logs and a
-fingerprint of committed, modified and untracked source. Failed checks block
-deployment; any source change invalidates previous checks. Fix and rerun affected
-checks, with at most three repair attempts without progress before reporting a
-concrete blocker. Do not delete or weaken a failing check to make the run green.
+1. **Planner:** inspect product context; write a small dependency-ordered plan.
+   The JSON schema is `{"tickets":[{"id":"T1","title":"...","body":"...",
+   "acceptance":["observable outcome"],"depends_on":[]}]}`. Store the JSON under
+   `.slopteam/` and load with `plan --file ...`; the helper writes versioned tickets.
+   Commit those tickets. For an existing plan, inspect and continue it.
+2. **Builder:** dispatch one fresh worker for each available ticket. It uses
+   `ticket T1 --status in_progress`, implements and checks the feature, then
+   `ticket T1 --status done --summary "..."`. It commits code AND ticket updates.
+   A returned summary alone is not QA. Do not dispatch the tester until all
+   tickets are done and the last builder has stopped.
+3. **Tester:** send the acceptance contracts and actual files/commit to a fresh
+   conversation. It independently inspects behavior, writes missing regression
+   tests if useful, commits them and runs every relevant test/build/lint via
+   `check --command "..."`. Every check must pass on the final clean commit.
+   If it fails, record the failed worker, send the finding to a new builder for
+   the affected ticket, and then launch a new tester. A done ticket can reopen
+   with `--status in_progress --summary "QA finding"`. Stop after three repair
+   cycles without progress. Do not bypass failing or stale evidence.
+4. **Deployer:** dispatch only after the tester has completed successfully.
+   It runs `deploy --command "..." --smoke-command "..." --environment preview
+   --url https://TARGET` using existing project deployment scripts/credentials.
+   Verify the correct release and critical behavior at the actual target.
+   `verify-deploy` reruns smoke only after reconciling an uncertain deployment;
+   `--retry` is for a diagnosed failed deployment, never a blind repeat.
+   If deployment needs code changes, return to a builder then a fresh tester.
 
-## Deploy and verify
+The release gate requires completed separate planner/builder/tester sessions,
+current successful tests, the tester's source fingerprint, a clean commit and
+an assigned deployer. No-op checks do not prove correctness. A deployer cannot
+complete until deployment and smoke verification succeed.
 
-Use the repository's existing deployment mechanism and the user's authorized
-target. Complete build/package work first. If a target, credential or permission
-is missing, preserve the tested result and state exactly what is needed.
-Configure or repair the deployment scripts when that is within the request.
-Prefer a preview for a new app unless the user chose production. Do not merge
-protected branches, force push, or invent successful deployments.
-
-Run `deploy --command "DEPLOY_COMMAND" --smoke-command "LIVE_CHECK_COMMAND"
---environment preview --url https://DEPLOYED_URL` only after the checks pass.
-Both commands must be concrete and noninteractive. A command may call a script
-that waits for the hosting job and writes the returned URL; the smoke script
-must check the resulting deployment, its release identity and critical behavior.
-The `--url` value must identify that same target. A queued build is not success.
-When the URL is allocated dynamically, use the provider's stable preview alias
-or a checked-in deployment script with an explicit target; do not guess a URL.
-
-The helper requires a clean commit, all tickets done, current passing checks,
-a successful deployment command and a successful smoke check. It marks an
-interrupted deployment as uncertain and never repeats it implicitly. Use
-`verify-deploy` to retry only the smoke check after reconciling the provider's
-state. Use `deploy ... --retry` for a known failed deployment only when a retry
-is appropriate. A failed smoke check needs diagnosis before redeployment.
-
-After verified deployment, run `close-tickets` for published issues. If PRs are
-used, keep their state accurate: shipping a preview does not imply a merge.
-Report the repository/PR, tickets, exact checks, deployment URL and any remaining
-limitation. A local build or mock deployment is a test, not a live deployment.
+If no deployment target or credential exists, preserve the tested release and
+request the missing input. Do not invent hosting, buy services or treat a local
+build as deployment. Only use a local deployment target when that is the user's
+chosen scope. Report the tickets, worker roles/results, commit, checks, deployed
+URL and limitations. Keep tickets marked done once implemented; deployment state
+belongs in the checkpoint, so completing deployment does not change tested code.
 
 ## Recovery
 
-`status` is the source of truth after an interruption. Completed stages are
-retained, source changes invalidate check evidence, and deployment commands are
-never automatically retried. Do not edit checkpoint JSON to bypass a gate.
-The selected harness's permissions remain in effect. If the user stops or pauses,
-stop new work and leave the checkpoint available for an explicit continuation.
+Read `status` and reconcile each recorded running worker with Omni before doing
+anything new. Never redispatch a live worker. Inspect its history if the inbox
+notification was lost; record its confirmed terminal result and proceed.
+On stop/pause, cancel the active worker with `sys_cancel_task` using its recorded
+conversation ID, confirm its state, and start no new work until requested.
+Do not claim a worker stopped if cancellation is unconfirmed. Keep logs and state.

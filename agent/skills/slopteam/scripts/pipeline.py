@@ -23,7 +23,7 @@ class Blocked(Exception):
 
 
 def now():
-    return dt.datetime.now(dt.UTC).isoformat()
+    return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
 def call(argv, cwd, data=None):
@@ -103,7 +103,7 @@ class Pipeline:
         self.state["updated_at"] = now()
         atomic_json(self.directory / f"{self.run_id}.json", self.state)
 
-    def init(self, idea):
+    def init(self, idea, team=False):
         if not idea.strip():
             raise Blocked("The idea cannot be empty")
         if (self.directory / "active").exists():
@@ -112,14 +112,15 @@ class Pipeline:
                 raise Blocked("An unfinished run exists; use status and continue it")
         self.run_id = uuid.uuid4().hex[:12]
         self.state = {
-            "schema": 1,
+            "schema": 2,
             "id": self.run_id,
             "idea": idea,
             "created_at": now(),
             "tickets": [],
             "checks": {},
             "deployment": {},
-            "github": None,
+            "team": team,
+            "workers": [],
         }
         self.save()
         pointer = self.directory / "active.tmp"
@@ -178,7 +179,29 @@ class Pipeline:
                 "A plan already exists; preserve it and continue the current run"
             )
         self.state["tickets"] = output
+        for ticket in output:
+            self.write_ticket(ticket)
         self.save()
+
+    def write_ticket(self, ticket):
+        """Keep the ticket contract and progress in ordinary versioned Git files."""
+        directory = self.repo / "docs" / "slopteam" / self.run_id
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{ticket['id']}.md"
+        path.write_text(
+            f"# {ticket['id']}: {ticket['title']}\n\n"
+            f"Run: {self.run_id}\n\nStatus: {ticket['status']}\n\n"
+            f"Idea: {self.state['idea']}\n\n{ticket['body']}\n\n"
+            "## Acceptance criteria\n\n"
+            + "\n".join("- " + x for x in ticket["acceptance"])
+            + "\n\nDependencies: "
+            + (", ".join(ticket["depends_on"]) or "none")
+            + "\n\nProgress: "
+            + ticket.get("summary", "Not started")
+            + "\n",
+            encoding="utf-8",
+        )
+        ticket["path"] = str(path.relative_to(self.repo))
 
     def ticket(self, tid):
         for ticket in self.state["tickets"]:
@@ -191,7 +214,10 @@ class Pipeline:
         if status == ticket["status"]:
             return
         allowed = {"todo": "in_progress", "in_progress": "done"}
-        if allowed.get(ticket["status"]) != status:
+        reopening = ticket["status"] == "done" and status == "in_progress"
+        if reopening and not summary.strip():
+            raise Blocked("Reopening a ticket needs --summary describing the repair")
+        if not reopening and allowed.get(ticket["status"]) != status:
             raise Blocked("Tickets advance from todo to in_progress to done")
         if any(self.ticket(dep)["status"] != "done" for dep in ticket["depends_on"]):
             raise Blocked("Finish dependencies first")
@@ -200,9 +226,111 @@ class Pipeline:
                 "Done needs --summary with implementation and acceptance evidence"
             )
         ticket.update(status=status, summary=summary, updated_at=now())
-        if status == "done":
-            ticket["head"] = call(["git", "rev-parse", "HEAD"], self.repo)
+        self.write_ticket(ticket)
         self.save()
+
+    def latest_worker(self, role):
+        return next(
+            (w for w in reversed(self.state.get("workers", [])) if w["role"] == role),
+            None,
+        )
+
+    def worker_start(self, role, session_id, task, ticket_id=None):
+        if role not in ("planner", "builder", "tester", "deployer"):
+            raise Blocked("Unknown worker role")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", session_id) or not task.strip():
+            raise Blocked("A valid session ID and task are required")
+        workers = self.state.setdefault("workers", [])
+        if any(w["session_id"] == session_id for w in workers):
+            raise Blocked(
+                "Each dispatch needs a distinct session; do not reuse a builder as tester"
+            )
+        if any(w["status"] == "running" for w in workers):
+            raise Blocked(
+                "Finish or reconcile the running worker before dispatching another"
+            )
+        if (
+            role != "planner"
+            and (self.latest_worker("planner") or {}).get("status") != "completed"
+        ):
+            raise Blocked("The planner must complete first")
+        if role == "builder":
+            if not ticket_id:
+                raise Blocked("A builder needs --ticket ID")
+            self.ticket(ticket_id)
+        if role in ("tester", "deployer"):
+            if (self.latest_worker("builder") or {}).get("status") != "completed":
+                raise Blocked("The builder must complete first")
+            if not self.state["tickets"] or any(
+                t["status"] != "done" for t in self.state["tickets"]
+            ):
+                raise Blocked("Finish all tickets before independent testing")
+        if role == "deployer":
+            self.release_gate(require_deployer=False)
+        workers.append(
+            {
+                "role": role,
+                "session_id": session_id,
+                "task": task,
+                "ticket": ticket_id,
+                "status": "running",
+                "started_at": now(),
+            }
+        )
+        self.state["team"] = True
+        self.save()
+
+    def worker_finish(self, session_id, status, summary):
+        worker = next(
+            (w for w in self.state.get("workers", []) if w["session_id"] == session_id),
+            None,
+        )
+        if not worker or worker["status"] != "running":
+            raise Blocked("No running worker has that session ID")
+        if status not in ("completed", "failed") or not summary.strip():
+            raise Blocked("A terminal worker status and evidence summary are required")
+        if status == "completed":
+            if worker["role"] == "planner" and not self.state["tickets"]:
+                raise Blocked("The planner has not produced a plan")
+            if (
+                worker["role"] == "builder"
+                and self.ticket(worker["ticket"])["status"] != "done"
+            ):
+                raise Blocked("The assigned ticket is not done")
+            if call(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"], self.repo
+            ):
+                raise Blocked("Commit the worker output before marking it completed")
+            if worker["role"] == "tester":
+                fingerprint = self.release_gate(check_team=False)
+            else:
+                fingerprint = self.fingerprint()
+            if worker["role"] == "deployer":
+                deployment = self.state["deployment"]
+                if (
+                    deployment.get("status") != "verified"
+                    or deployment.get("fingerprint") != fingerprint
+                ):
+                    raise Blocked("The deployer has not verified the current release")
+            worker.update(
+                head=call(["git", "rev-parse", "HEAD"], self.repo),
+                fingerprint=fingerprint,
+            )
+        worker.update(status=status, summary=summary, finished_at=now())
+        self.save()
+
+    def team_gate(self, fingerprint, require_deployer=True):
+        for role in ("planner", "builder", "tester"):
+            if (self.latest_worker(role) or {}).get("status") != "completed":
+                raise Blocked(
+                    f"The separate {role} agent must complete before deployment"
+                )
+        if self.latest_worker("tester").get("fingerprint") != fingerprint:
+            raise Blocked("The independent tester must verify the current source")
+        if require_deployer and (self.latest_worker("deployer") or {}).get(
+            "status"
+        ) not in ("running", "completed"):
+            raise Blocked("Dispatch a separate deployer agent before deployment")
 
     def fingerprint(self):
         digest = hashlib.sha256()
@@ -283,7 +411,7 @@ class Pipeline:
             raise Blocked(f"Check failed or changed source; inspect {result['log']}")
         return result
 
-    def release_gate(self):
+    def release_gate(self, check_team=True, require_deployer=True):
         tickets = self.state["tickets"]
         if not tickets or any(t["status"] != "done" for t in tickets):
             raise Blocked("Finish all planned tickets before deployment")
@@ -302,6 +430,8 @@ class Pipeline:
             raise Blocked(
                 "Run all checks successfully on the current source before deployment"
             )
+        if check_team and self.state.get("team"):
+            self.team_gate(fingerprint, require_deployer)
         return fingerprint
 
     def deploy(self, command, smoke, environment, url, timeout, retry=False):
@@ -365,130 +495,6 @@ class Pipeline:
         if deployment["status"] != "verified":
             raise Blocked(f"Deployment is unverified; inspect {result['log']}")
 
-    def gh(self, args, body=None):
-        output = call(
-            ["gh", *args], self.repo, json.dumps(body) if body is not None else None
-        )
-        try:
-            return json.loads(output)
-        except ValueError as exc:
-            raise Blocked(
-                "GitHub returned an unreadable response; reconcile before retrying"
-            ) from exc
-
-    def marker(self, ticket):
-        return f"<!-- slopteam:{self.run_id}:{ticket['id']} -->"
-
-    def publish_tickets(self, github):
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", github):
-            raise Blocked("GitHub repository must be OWNER/REPO")
-        if not self.state["tickets"]:
-            raise Blocked("Load a plan before publishing tickets")
-        if self.state["github"] and self.state["github"] != github:
-            raise Blocked("This run is already bound to another GitHub repository")
-        self.state["github"] = github
-        self.save()
-        pages = self.gh(
-            [
-                "api",
-                "--paginate",
-                "--slurp",
-                f"repos/{github}/issues?state=all&per_page=100",
-            ]
-        )
-        issues = [i for page in pages for i in page if "pull_request" not in i]
-        for ticket in self.state["tickets"]:
-            if ticket.get("issue"):
-                continue
-            matches = [
-                i for i in issues if self.marker(ticket) in (i.get("body") or "")
-            ]
-            if len(matches) > 1:
-                raise Blocked(
-                    f"Multiple issues match {ticket['id']}; reconcile explicitly"
-                )
-            if matches:
-                ticket.update(
-                    issue=matches[0]["number"],
-                    issue_url=matches[0]["html_url"],
-                    publishing=False,
-                )
-                self.save()
-                continue
-            if ticket.get("publishing"):
-                raise Blocked(
-                    f"{ticket['id']} creation outcome is uncertain; use reconcile-ticket"
-                )
-            ticket["publishing"] = True
-            self.save()
-            body = (
-                ticket["body"]
-                + "\n\nAcceptance criteria:\n"
-                + "\n".join("- [ ] " + x for x in ticket["acceptance"])
-            )
-            body += (
-                "\n\nDependencies: "
-                + (", ".join(ticket["depends_on"]) or "none")
-                + "\n\n"
-                + self.marker(ticket)
-            )
-            issue = self.gh(
-                ["api", "--method", "POST", f"repos/{github}/issues", "--input", "-"],
-                {"title": f"[{ticket['id']}] {ticket['title']}", "body": body},
-            )
-            ticket.update(
-                issue=issue["number"], issue_url=issue["html_url"], publishing=False
-            )
-            self.save()
-
-    def reconcile_ticket(self, tid, issue_number, not_created):
-        ticket = self.ticket(tid)
-        if ticket.get("issue"):
-            raise Blocked("This ticket already has a linked issue")
-        if issue_number:
-            github = self.state["github"]
-            if not github:
-                raise Blocked("Publish tickets first to bind the GitHub repository")
-            issue = self.gh(["api", f"repos/{github}/issues/{issue_number}"])
-            if "pull_request" in issue or self.marker(ticket) not in (
-                issue.get("body") or ""
-            ):
-                raise Blocked(
-                    "The issue does not contain this ticket’s exact run marker"
-                )
-            ticket.update(issue=issue["number"], issue_url=issue["html_url"])
-        elif not not_created:
-            raise Blocked("Choose --issue NUMBER or --not-created")
-        ticket["publishing"] = False
-        self.save()
-
-    def close_tickets(self):
-        fingerprint = self.release_gate()
-        deployment = self.state["deployment"]
-        if (
-            deployment.get("status") != "verified"
-            or deployment.get("fingerprint") != fingerprint
-        ):
-            raise Blocked("Verify the current release before closing issues")
-        github = self.state["github"]
-        if not github:
-            raise Blocked("No GitHub tickets were published")
-        for ticket in self.state["tickets"]:
-            if ticket.get("issue") and not ticket.get("closed"):
-                self.gh(
-                    [
-                        "api",
-                        "--method",
-                        "PATCH",
-                        f"repos/{github}/issues/{ticket['issue']}",
-                        "--input",
-                        "-",
-                    ],
-                    {"state": "closed", "state_reason": "completed"},
-                )
-                ticket["closed"] = True
-                self.save()
-
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -497,6 +503,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="action", required=True)
     p = sub.add_parser("init", help="Start a run")
     p.add_argument("--idea", required=True)
+    p.add_argument("--team", action="store_true", help="Require separate stage agents")
     sub.add_parser("status", help="Show checkpoint JSON")
     p = sub.add_parser("plan", help="Load a validated ticket dependency graph")
     p.add_argument("--file", type=Path, required=True)
@@ -504,13 +511,19 @@ def main(argv=None):
     p.add_argument("id")
     p.add_argument("--status", choices=["in_progress", "done"], required=True)
     p.add_argument("--summary", default="")
-    p = sub.add_parser("tickets", help="Publish/reconcile GitHub issues")
-    p.add_argument("--github", required=True)
-    p = sub.add_parser("reconcile-ticket", help="Resolve an uncertain issue creation")
-    p.add_argument("id")
-    group = p.add_mutually_exclusive_group(required=True)
-    group.add_argument("--issue", type=int)
-    group.add_argument("--not-created", action="store_true")
+    p = sub.add_parser("worker", help="Record a real Omni worker dispatch or result")
+    wp = p.add_subparsers(dest="worker_action", required=True)
+    p = wp.add_parser("start")
+    p.add_argument(
+        "--role", choices=["planner", "builder", "tester", "deployer"], required=True
+    )
+    p.add_argument("--session-id", required=True)
+    p.add_argument("--task", required=True)
+    p.add_argument("--ticket")
+    p = wp.add_parser("finish")
+    p.add_argument("--session-id", required=True)
+    p.add_argument("--status", choices=["completed", "failed"], required=True)
+    p.add_argument("--summary", required=True)
     p = sub.add_parser("check", help="Run and record a test/build/lint check")
     p.add_argument("--command", required=True)
     p.add_argument("--timeout", type=int, default=900)
@@ -523,22 +536,26 @@ def main(argv=None):
     p.add_argument("--retry", action="store_true")
     p = sub.add_parser("verify-deploy", help="Rerun only the live smoke check")
     p.add_argument("--timeout", type=int, default=900)
-    sub.add_parser("close-tickets", help="Close issues after verified deployment")
     args = parser.parse_args(argv)
     try:
         with Pipeline(args.repo, args.run).locked() as pipeline:
             if args.action == "init":
-                pipeline.init(args.idea)
+                pipeline.init(args.idea, args.team)
             else:
                 pipeline.load()
                 if args.action == "plan":
                     pipeline.plan(json.loads(args.file.read_text()))
                 elif args.action == "ticket":
                     pipeline.mark(args.id, args.status, args.summary)
-                elif args.action == "tickets":
-                    pipeline.publish_tickets(args.github)
-                elif args.action == "reconcile-ticket":
-                    pipeline.reconcile_ticket(args.id, args.issue, args.not_created)
+                elif args.action == "worker":
+                    if args.worker_action == "start":
+                        pipeline.worker_start(
+                            args.role, args.session_id, args.task, args.ticket
+                        )
+                    else:
+                        pipeline.worker_finish(
+                            args.session_id, args.status, args.summary
+                        )
                 elif args.action == "check":
                     pipeline.check(args.command, args.timeout)
                 elif args.action == "deploy":
@@ -552,8 +569,6 @@ def main(argv=None):
                     )
                 elif args.action == "verify-deploy":
                     pipeline.verify_deploy(args.timeout)
-                elif args.action == "close-tickets":
-                    pipeline.close_tickets()
             print(json.dumps(pipeline.state, indent=2))
     except (Blocked, OSError, ValueError, KeyError) as exc:
         print(f"slopteam: {exc}", file=sys.stderr)
