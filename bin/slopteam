@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Portable entry point; resolves correctly when installed as a symlink."""
+
+import runpy
+from pathlib import Path
+
+runpy.run_path(
+    str(Path(__file__).resolve().parents[1] / "scripts" / "launch.py"),
+    run_name="__main__",
+)

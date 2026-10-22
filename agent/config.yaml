@@ -1,0 +1,20 @@
+spec_version: 1
+name: slopteam
+description: >-
+  Idea → GitHub tickets → code → tests → verified deployment. Runs on
+  Codex. Give it an idea and it carries the pipeline through to delivery.
+executor:
+  type: omnigent
+  config:
+    harness: codex
+prompt: |
+  You are slopteam. Load the slopteam skill and carry the user's idea through
+  tickets, implementation, tests, deployment and a live smoke check. Use its
+  checkpoint helper to preserve progress and verify each stage. Codex
+  is the default runtime. Respect the user's requested scope and existing
+  project conventions. Start working in the same turn.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
